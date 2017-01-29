@@ -5,99 +5,193 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use std::cmp::{max, min};
-use std::{env, fmt};
+use std::env;
 use std::fs::File;
 use std::path::Path;
 use std::io;
-use std::io::{Read, Write, stdin, stdout};
+use std::io::{BufRead, BufReader, Write, stdin, stdout};
 
-struct Point {
-    column: u32,
-    line: u32
-}
+type Point = usize;
 
-impl Point {
-    fn new() -> Point {
-        Point {column: 1, line: 1}
-    }
-}
-
-impl fmt::Display for Point {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}:{}", self.column, self.line)
-    }
-}
-
+// View into the buffer.
 struct View {
-    y: u32,
-    height: u32
+    y: usize,
+    height: usize // How many lines to draw.
 }
 
 impl View {
-    fn adjust(&mut self, point: &Point) {
-        if point.line < self.y {
-            self.y = point.line;
-        // Add 1 (and 2 instead of 1) because termion starts indexing at 1...
-        } else if point.line + 1 >= self.y + self.height {
-            self.y = point.line - self.height + 2;
+    fn adjust(&mut self, line: usize) {
+        if line < self.y {
+            self.y = line;
+        }
+        else if line >= self.y + self.height {
+            self.y = line - self.height + 1;
         }
     }
 }
+
+
+// Ideally, this should be a Rope. Let's make the API the same, so it can later be replaced by a Rope
+// implementation.
+struct Text {
+    length: usize,
+    newlines: usize,
+    text: Vec<String>
+}
+
+impl Text {
+    fn from_file<P: AsRef<Path>>(file_path: P) -> io::Result<Text> {
+        let f = try!(File::open(&file_path));
+        let reader = BufReader::new(f);
+        let mut text = Vec::new();
+        let mut length = 0;
+        let mut newlines = 0;
+        for l in reader.lines() {
+            let line = l.unwrap();
+            length += line.len() + 1; // Count the newline. TODO: This won't work if the newline is not '\n'.
+            newlines += 1;
+            text.push(line);
+        }
+        Ok(Text{
+            length: if length == 0 {0} else {length - 1}, // An extra line was added above.
+            newlines: newlines,
+            text: text
+        })
+    }
+
+    // NOTE: This has to be blazingly fast, but this implementation will get *very* slow for big
+    // amounts of lines.
+    fn line_at(&self, p: Point) -> (usize, usize, usize) {
+        let mut line = 0;
+        let mut start = 0;
+        let mut len = 0;
+        for l in &self.text {
+            len = l.len();
+            if p > start + len {
+                start += len + 1;
+                line += 1;
+            }
+            else {
+                break;
+            }
+        }
+        (line, start, len)
+    }
+
+    fn insert(&mut self, pos: usize, s: String) {
+        unimplemented!();
+    }
+
+    fn delete(&mut self, pos: usize, count: usize) {
+        unimplemented!();
+    }
+
+    fn delete_line(&mut self, line: usize) {
+        if self.newlines > 0 {
+            if self.newlines == 1 {
+                self.length = 0;
+            }
+            else {
+                self.length -= self.text[line].len() + 1;
+            }
+            self.newlines -= 1;
+            // Index sanity should be checked by the caller. Let remove() panic if not sane.
+            self.text.remove(line);
+        }
+    }
+}
+
 
 struct Buffer {
     name: String,
     path: String,
     point: Point,
     view: View,
-    data: Vec<String>
+    data: Text
 }
 
 impl Buffer {
     fn load<P: AsRef<Path>>(file_path: P) -> io::Result<Buffer> {
-        let mut f = try!(File::open(&file_path));
-        let mut data = String::new();
-        try!(f.read_to_string(&mut data));
-
         let size = termion::terminal_size().unwrap();
-        let view = View {y: 1, height: size.1 as u32};
+        // Leave space for the status bar.
+        let view = View {y: 0, height: (size.1 - 1) as usize};
         let name = file_path.as_ref().file_name().unwrap().to_str().unwrap().to_string();
         let path = file_path.as_ref().to_str().unwrap().to_string();
 
-        let mut lines = Vec::new();
-        for l in data.lines() {
-            lines.push(l.to_string());
-        }
-
         Ok(Buffer {name: name,
             path: path,
-            point: Point::new(),
+            point: 0,
             view: view,
-            data: lines
+            data: try!(Text::from_file(file_path))
         })
     }
 
-    fn lines(&self) -> u32 {
-        self.data.len() as u32
+    fn lines(&self) -> usize {
+        self.data.newlines
+    }
+
+    fn move_right(&mut self) {
+        self.point = max(0, min(self.data.length, self.point + 1));
+        let (line, _, _) = self.data.line_at(self.point);
+        self.view.adjust(line);
+    }
+
+    fn move_left(&mut self) {
+        if self.point > 0 {
+            self.point = max(0, self.point - 1);
+        }
+        let (line, _, _) = self.data.line_at(self.point);
+        self.view.adjust(line);
+    }
+
+    fn move_end_of_line(&mut self) {
+        let (_, start, len) = self.data.line_at(self.point);
+        self.point = start + len;
+    }
+
+    fn move_start_of_line(&mut self) {
+        let (_, start, _) = self.data.line_at(self.point);
+        self.point = start;
     }
 
     fn move_down(&mut self) {
-        self.point.line = min(self.lines(), self.point.line + 1);
-        self.view.adjust(&self.point)
+        let (_, start, len) = self.data.line_at(self.point);
+        self.point = min(self.data.length, start + len + 1);
+        let (line, _, _) = self.data.line_at(self.point);
+        self.view.adjust(line);
     }
 
     fn move_up(&mut self) {
-        self.point.line = max(1, self.point.line - 1);
-        self.view.adjust(&self.point)
+        let (_, start, _) = self.data.line_at(self.point);
+        if start == 0 {
+            self.point = 0;
+        }
+        else {
+            self.point = start - 1;
+            let (_, start, _) = self.data.line_at(self.point);
+            self.point = start;
+        }
+        let (line, _, _) = self.data.line_at(self.point);
+        self.view.adjust(line)
     }
 
     fn move_start(&mut self) {
-        self.point.line = 1;
-        self.view.adjust(&self.point)
+        self.point = 0;
+        self.view.adjust(0);
     }
 
     fn move_end(&mut self) {
-        self.point.line = self.lines();
-        self.view.adjust(&self.point)
+        let line = self.lines() - 1;
+        self.point = self.data.length;
+        self.view.adjust(line);
+    }
+
+    fn delete_line(&mut self) {
+        let (line, start, _) = self.data.line_at(self.point);
+        self.data.delete_line(line);
+        self.point = max(0, min(self.data.length, start));
+        let (line, _, _) = self.data.line_at(self.point);
+        self.view.adjust(line);
     }
 }
 
@@ -105,44 +199,61 @@ impl Buffer {
 fn display(stdout: &mut io::Stdout, buffer: &Buffer) {
     display_lines(stdout, buffer);
     display_status_line(stdout, buffer);
-    display_point(stdout, &buffer.point, &buffer.view);
+    display_point(stdout, buffer);
     stdout.flush().unwrap();
 }
 
 fn display_lines(stdout: &mut io::Stdout, buffer: &Buffer) {
-    let mut ln = 1;
-    let i = (buffer.view.y - 1) as usize;
+    if buffer.lines() == 0 {
+        write!(stdout, "{}", clear::All).unwrap();
+        return;
+    }
 
-    for l in &buffer.data[i..] {
+    let mut ln = 0;
+    let i = buffer.view.y;
+    let lines = &buffer.data.text[i..];
+    let count = lines.len();
+
+    for l in lines {
         write!(stdout, "{goto}{line}{clear}",
-               goto = cursor::Goto(1, ln),
+               // Add 1 because termion starts indexing at 1...
+               goto = cursor::Goto(1, ln + 1),
                line = l,
                clear = clear::UntilNewline).unwrap();
         ln += 1;
-        if ln > buffer.view.height as u16 {
+        if ln as usize >= count {
+            write!(stdout, "{}", clear::AfterCursor).unwrap();
+            break;
+        }
+        // Render buffer.view.height lines.
+        else if ln as usize >= buffer.view.height {
             break;
         }
     }
 }
 
 fn display_status_line(stdout: &mut io::Stdout, buffer: &Buffer) {
-    write!(stdout, "{goto}", goto = cursor::Goto(1, buffer.view.height as u16)).unwrap();
-    write!(stdout, "{bold}{color}{name} [{path}]  {point}({lines}){boldreset}{colorreset}",
+    let (line, start, _) = buffer.data.line_at(buffer.point);
+    write!(stdout, "{goto}", goto = cursor::Goto(1, (buffer.view.height + 1) as u16)).unwrap();
+    write!(stdout, "{bold}{color}{name} [{path}]  {column}:{line}/{lines}{boldreset}{colorreset}",
            bold = style::Bold,
            color = color::Fg(color::Blue),
            name = buffer.name,
            path = buffer.path,
-           point = buffer.point,
+           column = buffer.point - start + 1,
+           line = line + 1,
            lines = buffer.lines(),
            boldreset = style::Reset,
            colorreset = color::Fg(color::Reset)).unwrap();
     write!(stdout, "{clear}", clear = clear::UntilNewline).unwrap();
 }
 
-fn display_point(stdout: &mut io::Stdout, point: &Point, view: &View) {
+fn display_point(stdout: &mut io::Stdout, buffer: &Buffer) {
+    let (line, start, _) = buffer.data.line_at(buffer.point);
     write!(stdout, "{}",
            // Add 1 because termion starts indexing at 1...
-           cursor::Goto(1, (point.line - view.y + 1) as u16)).unwrap();
+           cursor::Goto((buffer.point - start + 1) as u16,
+                        (line - buffer.view.y + 1) as u16)).unwrap();
 }
 
 macro_rules! die {
@@ -173,8 +284,12 @@ fn main() {
 
     for c in stdin.keys() {
         match c.unwrap() {
-            Key::Down | Key::Char('k') => { buf.move_down() }
-            Key::Up   | Key::Char('i') => { buf.move_up() }
+            Key::Right | Key::Char('l') => { buf.move_right() }
+            Key::Left  | Key::Char('j') => { buf.move_left() }
+            Key::Down  | Key::Char('k') => { buf.move_down() }
+            Key::Up    | Key::Char('i') => { buf.move_up() }
+            Key::End   | Key::Char('L') => { buf.move_end_of_line() }
+            Key::Home  | Key::Char('J') => { buf.move_start_of_line() }
             Key::PageDown | Key::Char('K') => {
                 for _ in 0..size.1 {
                     buf.move_down();
@@ -187,6 +302,8 @@ fn main() {
             }
             Key::Char('>') => { buf.move_end() }
             Key::Char('<') => { buf.move_start() }
+
+            Key::Char('d') => { buf.delete_line() }
             Key::Char('q') => { break; }
             _ => { }
         }
